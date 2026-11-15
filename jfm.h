@@ -1,6 +1,10 @@
 #ifndef JFM_H
 #define JFM_H
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,12 +21,22 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
 #include <X11/extensions/Xrender.h>
 #include <X11/Xft/Xft.h>
+
+#include <getopt.h>
+#include <glib.h>
+#include <glib-unix.h>
+
+#include "xdg.h"
+#include "dbus.h"
+
+#define JFVERSION "1.1"
 
 #define nil NULL
 typedef unsigned char uchar;
@@ -105,6 +119,14 @@ extern int scrolling;
 extern int oldbuttons;
 extern int lastn;
 extern int selected;
+extern Config *cfg;
+extern int pickermode;
+extern int printuri;
+extern int showhidden;
+extern char *wintitle;
+extern Atom wmdelete;
+extern Rectangle okr;
+extern Rectangle cancelr;
 
 void redraw(void);
 void showerrstr(const char *msg);
@@ -149,5 +171,16 @@ char *mdate(Dir d);
 int menuhit(int x, int y, char **items, int nitems);
 int doexec(const char *cmd);
 char *quotestrdup(const char *s);
+void selclear(void);
+void seladd(int idx);
+void seltoggle(int idx);
+int selhas(int idx);
+void jfm_open_folder(const char *folder);
+void jfm_reveal(char **paths, int n);
+void jfm_show_properties(char **paths, int n);
+void jfm_raise_window(void);
+void picker_accept(void);
+void picker_cancel(void);
+void config_save_state(void);
 
 #endif
