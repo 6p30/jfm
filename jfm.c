@@ -40,6 +40,130 @@ int oldbuttons;
 int lastn;
 int selected = -1;
 
+Config *cfg;
+int pickermode;
+int printuri;
+int showhidden;
+char *wintitle;
+Atom wmdelete;
+Rectangle okr;
+Rectangle cancelr;
+
+static char *portaltoken;
+static char *portaldest;
+static char *portaltitle;
+static char *portaldir;
+static char *portalmode;
+static char *portalname;
+
+static int *selsel;
+static int nselsel;
+
+static int dragidx = -1;
+static int droptarget = -1;
+static int dragmoved;
+
+static char *accepttypes;
+
+static int
+mime_accepted(const char *path)
+{
+	if (!accepttypes || !*accepttypes)
+		return 1;
+	char *mime = xdg_mime_of(path);
+	const char *base = strrchr(path, '/');
+	base = base ? base + 1 : path;
+	int rc = 0;
+	char *copy = strdup(accepttypes);
+	char *save = nil;
+	for (char *tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(nil, ",", &save)) {
+		while (*tok == ' ')
+			tok++;
+		size_t tl = strlen(tok);
+		while (tl > 0 && tok[tl - 1] == ' ')
+			tok[--tl] = 0;
+		if (!*tok)
+			continue;
+		if (strcmp(tok, "*") == 0 || strcmp(tok, "*/*") == 0 || strcasecmp(tok, "all") == 0) {
+			rc = 1;
+			break;
+		}
+		if (strcmp(tok, mime) == 0) {
+			rc = 1;
+			break;
+		}
+		size_t len = strlen(tok);
+		if (len > 2 && tok[len - 2] == '/' && tok[len - 1] == '*') {
+			if (strncmp(mime, tok, len - 1) == 0) {
+				rc = 1;
+				break;
+			}
+		}
+		if (strchr(tok, '*') || strchr(tok, '?') || tok[0] == '.') {
+			char pat[256];
+			if (tok[0] == '.')
+				snprintf(pat, sizeof(pat), "*%s", tok);
+			else
+				snprintf(pat, sizeof(pat), "%s", tok);
+			if (fnmatch(pat, base, FNM_CASEFOLD) == 0) {
+				rc = 1;
+				break;
+			}
+		}
+	}
+	free(copy);
+	free(mime);
+	return rc;
+}
+
+void
+selclear(void)
+{
+	free(selsel);
+	selsel = nil;
+	nselsel = 0;
+	selected = -1;
+}
+
+void
+seladd(int idx)
+{
+	if (idx < 0)
+		return;
+	if (selhas(idx))
+		return;
+	selsel = realloc(selsel, sizeof(int) * (nselsel + 1));
+	selsel[nselsel++] = idx;
+	selected = idx;
+}
+
+void
+seltoggle(int idx)
+{
+	if (idx < 0)
+		return;
+	for (int i = 0; i < nselsel; i++) {
+		if (selsel[i] != idx)
+			continue;
+		for (int j = i; j < nselsel - 1; j++)
+			selsel[j] = selsel[j + 1];
+		nselsel--;
+		if (nselsel == 0)
+			selected = -1;
+		return;
+	}
+	seladd(idx);
+}
+
+int
+selhas(int idx)
+{
+	for (int i = 0; i < nselsel; i++)
+		if (selsel[i] == idx)
+			return 1;
+	return 0;
+}
+
 char *
 expandtilde(char *s)
 {
@@ -179,6 +303,11 @@ drawbutton(Point *p, XftColor col, char *label)
 char *
 abspath(char *wd, char *p)
 {
+	if (p != nil && strncmp(p, "file://", 7) == 0) {
+		char *real = xdg_uri_to_path(p);
+		char *clean = cleanname(real);
+		return clean;
+	}
 	if (p[0] == '/') {
 		char *s = strdup(p);
 		return cleanname(s);
@@ -222,10 +351,14 @@ loaddirs(void)
 	while ((de = readdir(d))) {
 		if (strcmp(de->d_name, ".") == 0)
 			continue;
-		char fullpath[4096];
+		if (!showhidden && de->d_name[0] == '.')
+			continue;
+		char fullpath[8192];
 		snprintf(fullpath, sizeof(fullpath), "%s/%s", path, de->d_name);
 		struct stat st;
 		if (stat(fullpath, &st) < 0)
+			continue;
+		if (accepttypes && !S_ISDIR(st.st_mode) && !mime_accepted(fullpath))
 			continue;
 		dirs[ndirs].name = strdup(de->d_name);
 		dirs[ndirs].length = st.st_size;
@@ -236,7 +369,7 @@ loaddirs(void)
 	closedir(d);
 	qsort(dirs, ndirs, sizeof(Dir), dircmp);
 	offset = 0;
-	selected = -1;
+	selclear();
 	long long m = 1;
 	for (int i = 0; i < ndirs; i++)
 		if (dirs[i].length > m)
@@ -257,10 +390,14 @@ up(void)
 void
 cd(char *dir)
 {
-	char newpath[4096] = {0};
+	char newpath[8192] = {0};
 	if (dir == nil)
 		snprintf(newpath, sizeof(newpath), "%s", home);
-	else if (dir[0] == '~') {
+	else if (strncmp(dir, "file://", 7) == 0) {
+		char *p = xdg_uri_to_path(dir);
+		snprintf(newpath, sizeof(newpath), "%s", p);
+		free(p);
+	} else if (dir[0] == '~') {
 		char *expanded = expandtilde(dir);
 		snprintf(newpath, sizeof(newpath), "%s", expanded);
 		free(expanded);
@@ -425,13 +562,116 @@ plumbfile(char *dir, char *name)
 		redraw();
 		return 0;
 	}
-	pid_t pid = fork();
-	if (pid == 0) {
-		execlp("xdg-open", "xdg-open", f, (char *)nil);
-		_exit(1);
-	}
+	xdg_open_path(f);
 	free(f);
 	return 1;
+}
+
+void
+config_save_state(void)
+{
+	if (!cfg)
+		return;
+	char buf[64];
+	if (fontname)
+		config_set(cfg, "font", fontname);
+	snprintf(buf, sizeof(buf), "%d", Dx(screenr));
+	config_set(cfg, "width", buf);
+	snprintf(buf, sizeof(buf), "%d", Dy(screenr));
+	config_set(cfg, "height", buf);
+	snprintf(buf, sizeof(buf), "%d", showhidden);
+	config_set(cfg, "showhidden", buf);
+	config_save(cfg);
+}
+
+static void
+picker_emit(char **paths, int n)
+{
+	for (int i = 0; i < n; i++) {
+		if (printuri) {
+			char *uri = xdg_path_to_uri(paths[i]);
+			printf("%s\n", uri);
+			free(uri);
+		} else {
+			printf("%s\n", paths[i]);
+		}
+	}
+	fflush(stdout);
+}
+
+void
+picker_cancel(void)
+{
+	if (portaltoken && portaldest)
+		dbus_portal_deliver(portaldest, portaltoken, nil, 0);
+	config_save_state();
+	exit(1);
+}
+
+void
+picker_accept(void)
+{
+	char **paths = nil;
+	int n = 0;
+
+	if (pickermode == 4) {
+		char buf[4096] = {0};
+		if (portalname && *portalname)
+			snprintf(buf, sizeof(buf), "%s", portalname);
+		else if (selected >= 0 && selected < ndirs)
+			snprintf(buf, sizeof(buf), "%s", dirs[selected].name);
+		if (enter("Save as", buf, sizeof(buf)) <= 0) {
+			picker_cancel();
+			return;
+		}
+		paths = malloc(sizeof(char *));
+		paths[0] = smprint("%s/%s", path, buf);
+		n = 1;
+	} else if (pickermode == 1) {
+		if (selected >= 0 && selected < ndirs && dirs[selected].isdir) {
+			cd(dirs[selected].name);
+			redraw();
+			return;
+		}
+		for (int i = 0; i < nselsel; i++) {
+			if (selsel[i] < 0 || selsel[i] >= ndirs)
+				continue;
+			paths = realloc(paths, sizeof(char *) * (n + 1));
+			paths[n++] = smprint("%s/%s", path, dirs[selsel[i]].name);
+		}
+	} else {
+		for (int i = 0; i < nselsel; i++) {
+			if (selsel[i] < 0 || selsel[i] >= ndirs)
+				continue;
+			paths = realloc(paths, sizeof(char *) * (n + 1));
+			paths[n++] = smprint("%s/%s", path, dirs[selsel[i]].name);
+		}
+		if (n == 0 && pickermode == 2) {
+			paths = malloc(sizeof(char *));
+			paths[0] = strdup(path);
+			n = 1;
+		}
+	}
+	if (n == 0) {
+		picker_cancel();
+		return;
+	}
+	if (portaltoken && portaldest) {
+		char **uris = calloc(n + 1, sizeof(char *));
+		for (int i = 0; i < n; i++)
+			uris[i] = xdg_path_to_uri(paths[i]);
+		dbus_portal_deliver(portaldest, portaltoken, uris, n);
+		for (int i = 0; i < n; i++)
+			free(uris[i]);
+		free(uris);
+	} else {
+		picker_emit(paths, n);
+	}
+	for (int i = 0; i < n; i++)
+		free(paths[i]);
+	free(paths);
+	config_save_state();
+	exit(0);
 }
 
 void
@@ -632,20 +872,12 @@ mdate(Dir d)
 	return s;
 }
 
-void
-drawdir(int n, int isselected)
+static void
+drawdircol(int n, XftColor *bg, XftColor *fg)
 {
-	if (offset + n >= ndirs)
+	if (n < 0 || offset + n < 0 || offset + n >= ndirs)
 		return;
 	Dir *d = &dirs[offset + n];
-	XftColor *bg, *fg;
-	if (isselected) {
-		bg = &c_sel2bg;
-		fg = &c_sel2fg;
-	} else {
-		bg = &c_viewbg;
-		fg = &c_viewfg;
-	}
 
 	Point p = addpt(viewr.min, Pt(Toolpadding, Toolpadding));
 	p.y += n * lineh;
@@ -666,6 +898,54 @@ drawdir(int n, int isselected)
 	p = drawtext(p, *fg, d->name, viewr.max.x - xstringwidth(buf) - 2 * Padding - Toolpadding);
 	p.x = viewr.max.x - xstringwidth(buf) - 2 * Padding - Toolpadding;
 	xdrawstring(p, *fg, buf);
+}
+
+void
+drawdir(int n, int isselected)
+{
+	if (isselected)
+		drawdircol(n, &c_sel2bg, &c_sel2fg);
+	else
+		drawdircol(n, &c_viewbg, &c_viewfg);
+}
+
+static void
+drawdrop(int n)
+{
+	if (n < 0 || offset + n >= ndirs)
+		return;
+	drawdircol(n, &c_selbg, &c_selfg);
+	Rectangle r = Rect(viewr.min.x + Toolpadding,
+			   viewr.min.y + Toolpadding + n * lineh,
+			   viewr.max.x - Toolpadding,
+			   viewr.min.y + Toolpadding + (n + 1) * lineh);
+	xdrawrect(r, c_high);
+}
+
+static void
+setdroptarget(int idx)
+{
+	if (idx == droptarget)
+		return;
+	if (droptarget >= 0) {
+		drawdir(droptarget - offset, selhas(droptarget));
+		droptarget = -1;
+	}
+	if (idx >= 0 && idx < ndirs && dirs[idx].isdir && idx != dragidx) {
+		droptarget = idx;
+		drawdrop(idx - offset);
+	}
+	XFlush(dpy);
+}
+
+static void
+cleardroptarget(void)
+{
+	if (droptarget >= 0) {
+		drawdir(droptarget - offset, selhas(droptarget));
+		droptarget = -1;
+		XFlush(dpy);
+	}
 }
 
 void
@@ -693,11 +973,21 @@ redraw(void)
 	p.x += Toolpadding;
 	p.y = toolr.min.y + (Dy(toolr) - font->height) / 2 + font->ascent;
 	pathr = Rect(p.x, p.y - font->ascent, p.x + xstringwidth(path), p.y + font->descent);
-	p = drawtext(p, c_toolfg, path, screenr.max.x - 2 * (Toolpadding + xstringwidth("+") + Toolpadding));
-	p.x = screenr.max.x - 2 * (Toolpadding + xstringwidth("+") + Toolpadding);
+	int rightw = 2 * Toolpadding + xstringwidth("+") + 2 * Toolpadding + xstringwidth("f");
+	if (pickermode)
+		rightw += 2 * Toolpadding + xstringwidth("OK") + 2 * Toolpadding + xstringwidth("Cancel");
+	p = drawtext(p, c_toolfg, path, screenr.max.x - rightw - Padding);
+	p.x = screenr.max.x - rightw;
 	p.y = toolr.min.y + Toolpadding;
 	newdirr = drawbutton(&p, c_toolfg, "+");
 	newfiler = drawbutton(&p, c_toolfg, "f");
+	if (pickermode) {
+		okr = drawbutton(&p, c_toolfg, "OK");
+		cancelr = drawbutton(&p, c_toolfg, "Cancel");
+	} else {
+		okr = Rect(0, 0, 0, 0);
+		cancelr = Rect(0, 0, 0, 0);
+	}
 
 	xfillrect(scrollr, c_scrollbg);
 	if (ndirs > 0) {
@@ -710,7 +1000,7 @@ redraw(void)
 	xfillrect(scrposr, c_scrollfg);
 
 	for (int i = 0; i < nlines && offset + i < ndirs; i++)
-		drawdir(i, (offset + i == selected) ? 1 : 0);
+		drawdir(i, selhas(offset + i) ? 1 : 0);
 
 	XFlush(dpy);
 }
@@ -762,14 +1052,44 @@ evtresize(int w, int h)
 	redraw();
 }
 
+static void
+selmove(int delta)
+{
+	if (ndirs <= 0)
+		return;
+	int idx = selected;
+	if (idx < 0)
+		idx = delta > 0 ? -1 : ndirs;
+	idx += delta;
+	if (idx < 0)
+		idx = 0;
+	if (idx >= ndirs)
+		idx = ndirs - 1;
+	selclear();
+	seladd(idx);
+	if (idx < offset)
+		offset = idx;
+	if (idx >= offset + nlines)
+		offset = idx - nlines + 1;
+	offset = scrollclamp(offset);
+	redraw();
+}
+
 void
 evtkey(XEvent *e)
 {
 	KeySym k;
 	XLookupString(&e->xkey, nil, 0, &k, nil);
 	switch (k) {
+	case XK_Escape:
+		if (pickermode)
+			picker_cancel();
+		break;
 	case XK_q:
 	case XK_Delete:
+		if (pickermode)
+			picker_cancel();
+		config_save_state();
 		exit(0);
 	case XK_Page_Up:
 		scrollup(nlines);
@@ -782,19 +1102,35 @@ evtkey(XEvent *e)
 		redraw();
 		break;
 	case XK_Up:
-		up();
-		redraw();
+		if (pickermode)
+			selmove(-1);
+		else {
+			up();
+			redraw();
+		}
+		break;
+	case XK_Down:
+		if (pickermode)
+			selmove(1);
 		break;
 	case XK_Return:
 		if (selected >= 0 && selected < ndirs) {
 			Dir *d = &dirs[selected];
 			if (d->isdir) {
-				cd(d->name);
-				redraw();
+				if (pickermode == 2)
+					picker_accept();
+				else {
+					cd(d->name);
+					redraw();
+				}
+			} else if (pickermode) {
+				picker_accept();
 			} else {
 				plumbfile(path, d->name);
 				flash(selected - offset);
 			}
+		} else if (pickermode) {
+			picker_accept();
 		}
 		break;
 	case XK_space:
@@ -826,12 +1162,104 @@ indexat(Point p)
 	return offset + n;
 }
 
+static void
+openwith(Point mxy, int idx)
+{
+	char *full = smprint("%s/%s", path, dirs[idx].name);
+	char *mime = xdg_mime_of(full);
+	int n = 0;
+	char **apps = xdg_mime_apps(mime, &n);
+	if (n == 0) {
+		alert("No application found", "No handler is registered for this file type.");
+	} else {
+		char **items = calloc(n, sizeof(char *));
+		for (int i = 0; i < n; i++) {
+			char *nm = xdg_desktop_field(apps[i], "Name");
+			items[i] = nm ? nm : strdup(apps[i]);
+		}
+		int s = menuhit(mxy.x, mxy.y, items, n);
+		if (s >= 0 && s < n)
+			xdg_run_desktop(apps[s], full);
+		for (int i = 0; i < n; i++)
+			free(items[i]);
+		free(items);
+	}
+	for (int i = 0; i < n; i++)
+		free(apps[i]);
+	free(apps);
+	free(mime);
+	free(full);
+}
+
+static void
+scrolltrack(Point mxy)
+{
+	if (nlines >= ndirs) {
+		if (offset != 0) {
+			offset = 0;
+			redraw();
+		}
+		return;
+	}
+	int y = mxy.y - scrollr.min.y;
+	int range = ndirs - nlines;
+	int newoff = scrollclamp(y * range / Dy(scrollr));
+	if (newoff != offset) {
+		offset = newoff;
+		redraw();
+	}
+}
+
+static void
+move_selected_to(const char *destdir, int dragged)
+{
+	char *destabs = abspath(path, (char *)destdir);
+	struct stat st;
+	if (stat(destabs, &st) < 0 || !S_ISDIR(st.st_mode)) {
+		alert("Invalid destination", "The path is not a directory or does not exist.");
+		free(destabs);
+		return;
+	}
+	if (nselsel == 0 && dragged >= 0 && dragged < ndirs)
+		seladd(dragged);
+	int nex = 0, nfail = 0;
+	for (int i = 0; i < nselsel; i++) {
+		int idx = selsel[i];
+		if (idx < 0 || idx >= ndirs)
+			continue;
+		char *src = smprint("%s/%s", path, dirs[idx].name);
+		char *dest = smprint("%s/%s", destabs, dirs[idx].name);
+		if (access(dest, F_OK) == 0) {
+			nex++;
+		} else {
+			char *qfrom = quotestrdup(src);
+			char *qdest = quotestrdup(dest);
+			char *cmd = smprint("mv %s %s >/dev/null 2>&1", qfrom, qdest);
+			if (doexec(cmd) < 0)
+				nfail++;
+			free(cmd);
+			free(qdest);
+			free(qfrom);
+		}
+		free(src);
+		free(dest);
+	}
+	free(destabs);
+	if (nfail > 0)
+		alert("Move failed", "Check that the destination is valid and you have permission.");
+	else if (nex > 0)
+		alert("Move skipped", "Some files were not moved because a file with the same name exists.");
+	loaddirs();
+	redraw();
+}
+
 void
 evtmouse(XEvent *e)
 {
 	static int buttons = 0;
 	static Time lastclick = 0;
 	static int lastclickidx = -1;
+	static Point pressxy;
 	Point mxy;
 	int b = 0;
 
@@ -855,12 +1283,32 @@ evtmouse(XEvent *e)
 	} else if (e->type == ButtonRelease) {
 		b = e->xbutton.button;
 		mxy = Pt(e->xbutton.x, e->xbutton.y);
-		if (b == 1)
+		if (b == 1) {
 			buttons &= ~1;
-		else if (b == 2)
+			if (dragidx >= 0) {
+				if (dragmoved && !pickermode) {
+					int idx = indexat(mxy);
+					if (idx >= 0 && idx != dragidx && dirs[idx].isdir)
+						move_selected_to(dirs[idx].name, dragidx);
+					else if (ptinrect(mxy, upr))
+						move_selected_to("..", dragidx);
+					else if (ptinrect(mxy, homer))
+						move_selected_to(home, dragidx);
+				}
+				cleardroptarget();
+				dragidx = -1;
+				dragmoved = 0;
+			}
+			scrolling = 0;
+		} else if (b == 2) {
 			buttons &= ~2;
-		else if (b == 3)
+			scrolling = 0;
+		} else if (b == 3) {
 			buttons &= ~4;
+			scrolling = 0;
+		}
+		oldbuttons = buttons;
+		return;
 	} else if (e->type == MotionNotify) {
 		mxy = Pt(e->xmotion.x, e->xmotion.y);
 	}
@@ -871,88 +1319,145 @@ evtmouse(XEvent *e)
 		scrolling = 0;
 
 	if (buttons & 1) {
-		if (scrolling && e->type == MotionNotify) {
-			int dy = 1 + nlines * ((double)(mxy.y - scrollr.min.y) / Dy(scrollr));
-			scrollup(dy);
-		} else if (e->type == ButtonPress && ptinrect(mxy, viewr)) {
-			int idx = indexat(mxy);
-			if (idx >= 0) {
-				Time now = e->xbutton.time;
-				if (idx == lastclickidx && (now - lastclick < 400)) {
-					if (dirs[idx].isdir) {
-						cd(dirs[idx].name);
+		if (scrolling) {
+			if (ptinrect(mxy, scrollr) &&
+			    (e->type == MotionNotify || e->type == ButtonPress))
+				scrolltrack(mxy);
+		} else if (e->type == ButtonPress && ptinrect(mxy, okr)) {
+			picker_accept();
+		} else if (e->type == ButtonPress && ptinrect(mxy, cancelr)) {
+			picker_cancel();
+		} else if (e->type == ButtonPress && ptinrect(mxy, pathr)) {
+			loaddirs();
+			redraw();
+		} else if (ptinrect(mxy, viewr) || dragidx >= 0) {
+			if (e->type == ButtonPress) {
+				int idx = indexat(mxy);
+				pressxy = mxy;
+				if (idx >= 0) {
+					Time now = e->xbutton.time;
+					if (idx == lastclickidx && (now - lastclick < 400)) {
+						Dir *d = &dirs[idx];
+						if (d->isdir) {
+							if (pickermode == 2)
+								picker_accept();
+							else {
+								cd(d->name);
+								redraw();
+							}
+						} else if (pickermode) {
+							picker_accept();
+						} else {
+							if (plumbfile(path, d->name))
+								flash(idx - offset);
+						}
+						lastclickidx = -1;
+						dragidx = -1;
+					} else if (e->xbutton.state & ControlMask) {
+						seltoggle(idx);
+						lastclickidx = idx;
+						lastclick = now;
 						redraw();
+						dragidx = idx;
+						dragmoved = 0;
 					} else {
-						if (plumbfile(path, dirs[idx].name))
-							flash(idx - offset);
+						if (!selhas(idx)) {
+							selclear();
+							seladd(idx);
+						}
+						lastclickidx = idx;
+						lastclick = now;
+						redraw();
+						dragidx = idx;
+						dragmoved = 0;
 					}
-					lastclickidx = -1;
 				} else {
-					selected = idx;
-					lastclickidx = idx;
-					lastclick = now;
+					selclear();
+					lastclickidx = -1;
+					dragidx = -1;
 					redraw();
 				}
-			} else {
-				selected = -1;
-				lastclickidx = -1;
-				redraw();
+			} else if (e->type == MotionNotify && dragidx >= 0 && !pickermode) {
+				if (!dragmoved &&
+				    (abs(mxy.x - pressxy.x) + abs(mxy.y - pressxy.y) > 5))
+					dragmoved = 1;
+				if (ptinrect(mxy, viewr))
+					setdroptarget(dragmoved ? indexat(mxy) : -1);
+				else
+					cleardroptarget();
 			}
 		}
 	} else if (buttons & 2) {
-		if (e->type == ButtonPress && ptinrect(mxy, viewr)) {
+		if (scrolling) {
+			if (ptinrect(mxy, scrollr) &&
+			    (e->type == MotionNotify || e->type == ButtonPress))
+				scrolltrack(mxy);
+		} else if (e->type == ButtonPress && ptinrect(mxy, viewr)) {
 			int idx = indexat(mxy);
 			if (idx >= 0) {
-				char *items[] = { "rename", "delete", "move" };
-				int sel = menuhit(mxy.x, mxy.y, items, 3);
-				if (sel == 1) {
-					rm(dirs[idx]);
-					if (selected == idx) selected = -1;
+				if (pickermode) {
+					seltoggle(idx);
 					redraw();
-				} else if (sel == 0) {
-					char buf[4096] = {0};
-					snprintf(buf, sizeof(buf), "%s", dirs[idx].name);
-					if (enter("Rename to", buf, sizeof(buf)) > 0) {
-						mv(dirs[idx].name, buf);
-						if (selected == idx) selected = -1;
+				} else {
+					if (!selhas(idx)) {
+						selclear();
+						seladd(idx);
 						redraw();
 					}
-				} else if (sel == 2) {
-					char destdir[4096] = {0};
-					if (enter("Move to directory", destdir, sizeof(destdir)) > 0) {
-						char *expanded_dest = expandtilde(destdir);
-						char *destdir_abs = abspath(path, expanded_dest);
-						struct stat st;
-						if (stat(destdir_abs, &st) < 0 || !S_ISDIR(st.st_mode)) {
-							alert("Invalid destination", "The path is not a directory or does not exist.");
+					char *items[] = { "open", "open with", "rename", "delete", "move" };
+					int sel = menuhit(mxy.x, mxy.y, items, 5);
+					if (sel == 0) {
+						if (dirs[idx].isdir) {
+							cd(dirs[idx].name);
+							redraw();
 						} else {
-							char *src = smprint("%s/%s", path, dirs[idx].name);
-							char *dest = smprint("%s/%s", destdir_abs, dirs[idx].name);
-							movefile(src, dest);
-							free(src);
-							free(dest);
-							if (selected == idx) selected = -1;
+							if (plumbfile(path, dirs[idx].name))
+								flash(idx - offset);
 						}
-						free(destdir_abs);
-						free(expanded_dest);
+					} else if (sel == 1) {
+						openwith(mxy, idx);
+					} else if (sel == 2) {
+						char buf[4096] = {0};
+						snprintf(buf, sizeof(buf), "%s", dirs[idx].name);
+						if (enter("Rename to", buf, sizeof(buf)) > 0) {
+							mv(dirs[idx].name, buf);
+							if (selhas(idx)) selected = -1;
+							redraw();
+						}
+					} else if (sel == 3) {
+						rm(dirs[idx]);
+						if (selhas(idx)) selected = -1;
 						redraw();
+					} else if (sel == 4) {
+						char destdir[4096] = {0};
+						if (enter("Move to directory", destdir, sizeof(destdir)) > 0) {
+							char *expanded_dest = expandtilde(destdir);
+							char *destdir_abs = abspath(path, expanded_dest);
+							struct stat st;
+							if (stat(destdir_abs, &st) < 0 || !S_ISDIR(st.st_mode)) {
+								alert("Invalid destination", "The path is not a directory or does not exist.");
+							} else {
+								char *src = smprint("%s/%s", path, dirs[idx].name);
+								char *dest = smprint("%s/%s", destdir_abs, dirs[idx].name);
+								movefile(src, dest);
+								free(src);
+								free(dest);
+								if (selhas(idx)) selected = -1;
+							}
+							free(destdir_abs);
+							free(expanded_dest);
+							redraw();
+						}
 					}
 				}
 			}
-		} else if (scrolling && e->type == MotionNotify) {
-			if (nlines < ndirs) {
-				offset = scrollclamp(mxy.y * ndirs / Dy(scrollr));
-				redraw();
-			}
-		} else if (ptinrect(mxy, pathr) && e->type == ButtonPress) {
+		} else if (e->type == ButtonPress && ptinrect(mxy, pathr)) {
 			loaddirs();
 			redraw();
 		}
-	}
-	if ((buttons & 4) && oldbuttons == 0 && e->type == ButtonPress) {
-		if (scrolling) {
-			int dy = 1 + nlines * ((double)(mxy.y - scrollr.min.y) / Dy(scrollr));
-			scrolldown(dy);
+	} else if ((buttons & 4) && oldbuttons == 0 && e->type == ButtonPress) {
+		if (ptinrect(mxy, scrollr)) {
+			scrolltrack(mxy);
 		} else if (ptinrect(mxy, homer)) {
 			cd(home);
 			redraw();
@@ -983,18 +1488,21 @@ evtmouse(XEvent *e)
 		} else if (ptinrect(mxy, viewr)) {
 			int idx = indexat(mxy);
 			if (idx >= 0) {
-				char *items[] = { "open" };
-				int sel = menuhit(mxy.x, mxy.y, items, 1);
-				if (sel == 0) {
-					Dir *d = &dirs[idx];
-					if (d->isdir) {
-						cd(d->name);
-						redraw();
-					} else {
-						if (plumbfile(path, d->name))
-							flash(idx - offset);
-					}
+				Dir *d = &dirs[idx];
+				if (d->isdir) {
+					cd(d->name);
+					redraw();
+				} else if (pickermode) {
+					selclear();
+					seladd(idx);
+					picker_accept();
+				} else {
+					if (plumbfile(path, d->name))
+						flash(idx - offset);
 				}
+			} else {
+				up();
+				redraw();
 			}
 		}
 	}
@@ -1034,7 +1542,7 @@ smprint(const char *fmt, ...)
 void
 readhome(void)
 {
-	home = getenv("HOME");
+	home = xdg_home();
 	if (!home)
 		home = "/";
 }
@@ -1042,14 +1550,437 @@ readhome(void)
 void
 usage(void)
 {
-	fprintf(stderr, "usage: jfm [path]\n");
-	exit(1);
+	fprintf(stderr,
+		"usage: jfm [options] [path]\n"
+		"\n"
+		"  -f, --select-file       act as a file chooser and print the selected path\n"
+		"  -m, --select-multiple   act as a file chooser and print every selected path\n"
+		"  -d, --select-directory  act as a directory chooser\n"
+		"  -s, --save-file         act as a save dialog\n"
+		"  -S, --select            reveal/select specified item in its parent folder\n"
+		"  -u, --print-uri         print file:// uris instead of plain paths\n"
+		"  -t, --title TITLE       set the window title\n"
+		"  -D, --directory DIR     start inside DIR\n"
+		"  -H, --show-hidden       show hidden files\n"
+		"  -i, --install-desktop   install the desktop entry and register as default\n"
+		"  -I, --uninstall-desktop remove the desktop entry\n"
+		"  -b, --set-default       register jfm as the default application for folders\n"
+		"  -B, --unset-default     remove jfm as the default application for folders\n"
+		"  -P, --install-portal    install the desktop portal file chooser backend\n"
+		"  -p, --uninstall-portal  remove the desktop portal file chooser backend\n"
+		"  -M, --print-mime FILE   print the mime type of FILE\n"
+		"  -O, --open-uri URI      open URI with the default application\n"
+		"  -v, --version           print the version\n"
+		"  -h, --help              print this help\n");
+}
+
+static void
+handle_event(XEvent *e)
+{
+	switch (e->type) {
+	case Expose:
+		if (e->xexpose.count == 0)
+			redraw();
+		break;
+	case ConfigureNotify:
+		if (e->xconfigure.width != Dx(screenr) || e->xconfigure.height != Dy(screenr))
+			evtresize(e->xconfigure.width, e->xconfigure.height);
+		break;
+	case ButtonPress:
+	case ButtonRelease:
+	case MotionNotify:
+		evtmouse(e);
+		break;
+	case KeyPress:
+		evtkey(e);
+		break;
+	case ClientMessage:
+		if ((Atom)e->xclient.data.l[0] == wmdelete) {
+			config_save_state();
+			exit(0);
+		}
+		break;
+	}
+}
+
+static gboolean
+x_fd_cb(gint fd, GIOCondition cond, gpointer data)
+{
+	while (XPending(dpy)) {
+		XEvent e;
+		XNextEvent(dpy, &e);
+		handle_event(&e);
+	}
+	return G_SOURCE_CONTINUE;
+}
+
+void
+jfm_raise_window(void)
+{
+	if (!dpy || !win)
+		return;
+	XMapRaised(dpy, win);
+	XRaiseWindow(dpy, win);
+	XSetInputFocus(dpy, win, RevertToParent, CurrentTime);
+	XFlush(dpy);
+}
+
+void
+jfm_open_folder(const char *folder)
+{
+	if (!folder || !*folder)
+		return;
+	char *path_copy = xdg_uri_to_path(folder);
+	size_t len = strlen(path_copy);
+	while (len > 1 && path_copy[len - 1] == '/')
+		path_copy[--len] = 0;
+	cd(path_copy);
+	free(path_copy);
+	selclear();
+	redraw();
+	jfm_raise_window();
+}
+
+void
+jfm_reveal(char **paths, int n)
+{
+	if (n <= 0)
+		return;
+	char *first = xdg_uri_to_path(paths[0]);
+	size_t flen = strlen(first);
+	while (flen > 1 && first[flen - 1] == '/')
+		first[--flen] = 0;
+
+	struct stat st;
+	if (stat(first, &st) == 0 && S_ISDIR(st.st_mode)) {
+		char *slash = strrchr(first, '/');
+		if (slash && slash != first) {
+			*slash = 0;
+			cd(first);
+		} else if (slash == first) {
+			cd("/");
+		} else {
+			cd(first);
+		}
+	} else {
+		char *slash = strrchr(first, '/');
+		if (slash) {
+			if (slash == first) {
+				cd("/");
+			} else {
+				*slash = 0;
+				cd(first);
+			}
+		}
+	}
+	free(first);
+
+	selclear();
+	int first_sel = -1;
+	for (int i = 0; i < n; i++) {
+		char *p = xdg_uri_to_path(paths[i]);
+		size_t l = strlen(p);
+		while (l > 1 && p[l - 1] == '/')
+			p[--l] = 0;
+		const char *base = strrchr(p, '/');
+		base = base ? base + 1 : p;
+		for (int j = 0; j < ndirs; j++) {
+			if (strcmp(dirs[j].name, base) != 0)
+				continue;
+			seladd(j);
+			if (first_sel < 0)
+				first_sel = j;
+			break;
+		}
+		free(p);
+	}
+	if (first_sel >= 0) {
+		if (first_sel < offset || first_sel >= offset + nlines) {
+			offset = first_sel - nlines / 2;
+			offset = scrollclamp(offset);
+		}
+	}
+	redraw();
+	jfm_raise_window();
+}
+
+void
+jfm_show_properties(char **paths, int n)
+{
+	if (n <= 0)
+		return;
+	jfm_reveal(paths, n);
+	char *first = xdg_uri_to_path(paths[0]);
+	struct stat st;
+	if (stat(first, &st) == 0) {
+		char *mime = xdg_mime_of(first);
+		char *time_str = ctime(&st.st_mtime);
+		if (time_str) {
+			char *nl = strchr(time_str, '\n');
+			if (nl) *nl = 0;
+		}
+		const char *base = strrchr(first, '/');
+		base = base ? base + 1 : first;
+		char info[1024];
+		snprintf(info, sizeof(info), "Size: %lld bytes | Modified: %s | Type: %s",
+			 (long long)st.st_size, time_str ? time_str : "unknown", mime);
+		alert(base, info);
+		free(mime);
+	}
+	free(first);
 }
 
 int
 main(int argc, char *argv[])
 {
 	setlocale(LC_CTYPE, "");
+
+	enum {
+		OPT_PORTAL_TOKEN = 1000,
+		OPT_PORTAL_DEST,
+		OPT_PORTAL_TITLE,
+		OPT_PORTAL_DIR,
+		OPT_PORTAL_ACCEPT,
+		OPT_PORTAL_MODE,
+		OPT_PORTAL_NAME,
+	};
+	static struct option options[] = {
+		{ "select-file", no_argument, nil, 'f' },
+		{ "choose-file", no_argument, nil, 'f' },
+		{ "select-directory", no_argument, nil, 'd' },
+		{ "select-multiple", no_argument, nil, 'm' },
+		{ "multiple", no_argument, nil, 'm' },
+		{ "save-file", no_argument, nil, 's' },
+		{ "select", no_argument, nil, 'S' },
+		{ "reveal", no_argument, nil, 'S' },
+		{ "print-uri", no_argument, nil, 'u' },
+		{ "title", required_argument, nil, 't' },
+		{ "directory", required_argument, nil, 'D' },
+		{ "show-hidden", no_argument, nil, 'H' },
+		{ "install-desktop", no_argument, nil, 'i' },
+		{ "uninstall-desktop", no_argument, nil, 'I' },
+		{ "set-default", no_argument, nil, 'b' },
+		{ "unset-default", no_argument, nil, 'B' },
+		{ "install-portal", no_argument, nil, 'P' },
+		{ "uninstall-portal", no_argument, nil, 'p' },
+		{ "print-mime", required_argument, nil, 'M' },
+		{ "open-uri", required_argument, nil, 'O' },
+		{ "portal-backend", no_argument, nil, 'R' },
+		{ "version", no_argument, nil, 'v' },
+		{ "help", no_argument, nil, 'h' },
+		{ "portal-token", required_argument, nil, OPT_PORTAL_TOKEN },
+		{ "portal-dest", required_argument, nil, OPT_PORTAL_DEST },
+		{ "portal-title", required_argument, nil, OPT_PORTAL_TITLE },
+		{ "portal-dir", required_argument, nil, OPT_PORTAL_DIR },
+		{ "portal-accept", required_argument, nil, OPT_PORTAL_ACCEPT },
+		{ "portal-mode", required_argument, nil, OPT_PORTAL_MODE },
+		{ "portal-name", required_argument, nil, OPT_PORTAL_NAME },
+		{ 0, 0, 0, 0 }
+	};
+
+	cfg = config_open();
+	readhome();
+
+	int mode = 0;
+	int wanturi = 0;
+	int sethidden = -1;
+	int action = 0;
+	int backend = 0;
+	int select_mode = 0;
+	char *title = nil;
+	char *dirarg = nil;
+	char *printmime = nil;
+	char *openuri = nil;
+
+	int opt;
+	while ((opt = getopt_long(argc, argv, "hvfmdsut:D:HiIbBpPM:O:RS", options, nil)) != -1) {
+		switch (opt) {
+		case 'f':
+			mode = 1;
+			break;
+		case 'm':
+			mode = 3;
+			break;
+		case 'd':
+			mode = 2;
+			break;
+		case 's':
+			mode = 4;
+			break;
+		case 'S':
+			select_mode = 1;
+			break;
+		case 'u':
+			wanturi = 1;
+			break;
+		case 't':
+			title = optarg;
+			break;
+		case 'D':
+			dirarg = optarg;
+			break;
+		case 'H':
+			sethidden = 1;
+			break;
+		case 'i':
+			action = 1;
+			break;
+		case 'I':
+			action = 2;
+			break;
+		case 'b':
+			action = 5;
+			break;
+		case 'B':
+			action = 6;
+			break;
+		case 'P':
+			action = 3;
+			break;
+		case 'p':
+			action = 4;
+			break;
+		case 'M':
+			printmime = optarg;
+			break;
+		case 'O':
+			openuri = optarg;
+			break;
+		case 'R':
+			backend = 1;
+			break;
+		case 'v':
+			printf("jfm %s\n", JFVERSION);
+			return 0;
+		case 'h':
+			usage();
+			return 0;
+		case OPT_PORTAL_TOKEN:
+			portaltoken = optarg;
+			break;
+		case OPT_PORTAL_DEST:
+			portaldest = optarg;
+			break;
+		case OPT_PORTAL_TITLE:
+			portaltitle = optarg;
+			break;
+		case OPT_PORTAL_DIR:
+			portaldir = optarg;
+			break;
+		case OPT_PORTAL_ACCEPT:
+			accepttypes = optarg;
+			break;
+		case OPT_PORTAL_MODE:
+			portalmode = optarg;
+			break;
+		case OPT_PORTAL_NAME:
+			portalname = optarg;
+			break;
+		default:
+			usage();
+			return 1;
+		}
+	}
+
+	if (portalmode) {
+		if (strcmp(portalmode, "save") == 0)
+			mode = 4;
+		else if (strcmp(portalmode, "directory") == 0)
+			mode = 2;
+		else if (strcmp(portalmode, "multiple") == 0)
+			mode = 3;
+		else
+			mode = 1;
+		if (!title)
+			title = portaltitle;
+		if (!dirarg)
+			dirarg = portaldir;
+	}
+
+	if (printmime) {
+		char *mime = xdg_mime_of(printmime);
+		printf("%s\n", mime);
+		free(mime);
+		return 0;
+	}
+
+	if (openuri) {
+		xdg_open_uri(openuri);
+		return 0;
+	}
+
+	if (backend) {
+		dbus_portal_backend(argv[0]);
+		return 0;
+	}
+
+	if (action) {
+		char *exe = realpath(argv[0], nil);
+		if (!exe)
+			exe = strdup(argv[0]);
+		switch (action) {
+		case 1: {
+			char *old = xdg_mime_default("inode/directory");
+			if (old && strcmp(old, "jfm.desktop") != 0)
+				config_set(cfg, "previous-default", old);
+			else if (!old)
+				config_set(cfg, "previous-default", "");
+			free(old);
+			xdg_install_desktop(exe);
+			xdg_mimeapps_set_default("inode/directory", "jfm.desktop");
+			config_save(cfg);
+			printf("jfm: desktop entry and dbus service installed\n");
+			break;
+		}
+		case 2: {
+			const char *prev = config_get(cfg, "previous-default", "");
+			if (prev && *prev)
+				xdg_mimeapps_set_default("inode/directory", prev);
+			else
+				xdg_mimeapps_remove_default("inode/directory", "jfm.desktop");
+			config_set(cfg, "previous-default", "");
+			config_save(cfg);
+			xdg_uninstall_desktop();
+			printf("jfm: desktop entry and dbus service removed\n");
+			break;
+		}
+		case 3:
+			xdg_install_portal(exe);
+			printf("jfm: portal backend installed\n");
+			break;
+		case 4:
+			xdg_uninstall_portal();
+			printf("jfm: portal backend removed\n");
+			break;
+		case 5: {
+			char *old = xdg_mime_default("inode/directory");
+			if (old && strcmp(old, "jfm.desktop") != 0)
+				config_set(cfg, "previous-default", old);
+			else if (!old)
+				config_set(cfg, "previous-default", "");
+			free(old);
+			xdg_install_desktop(exe);
+			xdg_mimeapps_set_default("inode/directory", "jfm.desktop");
+			config_save(cfg);
+			printf("jfm: default file manager for folders\n");
+			break;
+		}
+		case 6: {
+			const char *prev = config_get(cfg, "previous-default", "");
+			if (prev && *prev)
+				xdg_mimeapps_set_default("inode/directory", prev);
+			else
+				xdg_mimeapps_remove_default("inode/directory", "jfm.desktop");
+			config_set(cfg, "previous-default", "");
+			config_save(cfg);
+			xdg_uninstall_desktop();
+			printf("jfm: default file manager for folders removed\n");
+			break;
+		}
+		}
+		free(exe);
+		return 0;
+	}
 
 	dpy = XOpenDisplay(nil);
 	if (!dpy) {
@@ -1061,7 +1992,12 @@ main(int argc, char *argv[])
 	cmap = DefaultColormap(dpy, scr);
 	depth = DefaultDepth(dpy, scr);
 
-	int w = 800, h = 600;
+	int w = atoi(config_get(cfg, "width", "800"));
+	int h = atoi(config_get(cfg, "height", "600"));
+	if (w < 200)
+		w = 800;
+	if (h < 200)
+		h = 600;
 	win = XCreateSimpleWindow(dpy, RootWindow(dpy, scr), 0, 0, w, h, 0,
 				  BlackPixel(dpy, scr), WhitePixel(dpy, scr));
 	XSelectInput(dpy, win, ExposureMask | StructureNotifyMask | ButtonPressMask |
@@ -1069,55 +2005,108 @@ main(int argc, char *argv[])
 	XMapWindow(dpy, win);
 
 	gc = XCreateGC(dpy, win, 0, nil);
-	loadfont("Tamzen-12");
+	loadfont(config_get(cfg, "font", "Tamzen-12"));
 
-	XStoreName(dpy, win, "jfm");
+	XStoreName(dpy, win, title ? title : "jfm");
 
-	Atom wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-	XSetWMProtocols(dpy, win, &wm_delete, 1);
+	Atom wm_protocols = XInternAtom(dpy, "WM_PROTOCOLS", False);
+	wmdelete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+	XSetWMProtocols(dpy, win, &wmdelete, 1);
+	(void)wm_protocols;
 
 	if (getcwd(path, sizeof(path)) == NULL)
 		strcpy(path, "/");
-	if (argc > 2)
-		usage();
-	if (argc == 2 && access(argv[1], F_OK) == 0) {
-		char *tmp = abspath(path, argv[1]);
+	char *target_file_to_select = nil;
+	if (argc > optind) {
+		for (int i = optind; i < argc; i++) {
+			char *raw = argv[i];
+			char *expanded = nil;
+			if (strncmp(raw, "file://", 7) == 0) {
+				expanded = xdg_uri_to_path(raw);
+			} else if (raw[0] == '~') {
+				expanded = expandtilde(raw);
+			} else {
+				expanded = strdup(raw);
+			}
+			char *tmp = abspath(path, expanded);
+			free(expanded);
+
+			struct stat st;
+			if (stat(tmp, &st) == 0 && !S_ISDIR(st.st_mode)) {
+				char *slash = strrchr(tmp, '/');
+				if (slash) {
+					target_file_to_select = strdup(slash + 1);
+					if (slash == tmp)
+						strcpy(path, "/");
+					else {
+						*slash = 0;
+						strncpy(path, tmp, sizeof(path) - 1);
+						path[sizeof(path) - 1] = 0;
+					}
+				}
+			} else if (stat(tmp, &st) == 0 && S_ISDIR(st.st_mode) && select_mode) {
+				char *slash = strrchr(tmp, '/');
+				if (slash && slash != tmp) {
+					target_file_to_select = strdup(slash + 1);
+					*slash = 0;
+					strncpy(path, tmp, sizeof(path) - 1);
+					path[sizeof(path) - 1] = 0;
+				} else {
+					strncpy(path, tmp, sizeof(path) - 1);
+					path[sizeof(path) - 1] = 0;
+				}
+			} else {
+				strncpy(path, tmp, sizeof(path) - 1);
+				path[sizeof(path) - 1] = 0;
+			}
+			free(tmp);
+		}
+	}
+	if (dirarg) {
+		char *expanded = nil;
+		if (strncmp(dirarg, "file://", 7) == 0)
+			expanded = xdg_uri_to_path(dirarg);
+		else if (dirarg[0] == '~')
+			expanded = expandtilde(dirarg);
+		else
+			expanded = strdup(dirarg);
+		char *tmp = abspath(path, expanded);
+		free(expanded);
 		strncpy(path, tmp, sizeof(path) - 1);
 		path[sizeof(path) - 1] = 0;
 		free(tmp);
 	}
 
-	readhome();
+	pickermode = mode;
+	printuri = wanturi;
+	showhidden = atoi(config_get(cfg, "showhidden", "0"));
+	if (sethidden >= 0)
+		showhidden = sethidden;
+
 	loaddirs();
+	if (target_file_to_select) {
+		for (int j = 0; j < ndirs; j++) {
+			if (strcmp(dirs[j].name, target_file_to_select) == 0) {
+				seladd(j);
+				if (j < offset || j >= offset + nlines) {
+					offset = j - nlines / 2;
+					offset = scrollclamp(offset);
+				}
+				break;
+			}
+		}
+		free(target_file_to_select);
+	}
+
 	initcolors();
 
 	evtresize(w, h);
 
-	while (1) {
-		XEvent e;
-		XNextEvent(dpy, &e);
-		switch (e.type) {
-		case Expose:
-			if (e.xexpose.count == 0)
-				redraw();
-			break;
-		case ConfigureNotify:
-			if (e.xconfigure.width != Dx(screenr) || e.xconfigure.height != Dy(screenr))
-				evtresize(e.xconfigure.width, e.xconfigure.height);
-			break;
-		case ButtonPress:
-		case ButtonRelease:
-		case MotionNotify:
-			evtmouse(&e);
-			break;
-		case KeyPress:
-			evtkey(&e);
-			break;
-		case ClientMessage:
-			if ((Atom)e.xclient.data.l[0] == wm_delete)
-				exit(0);
-			break;
-		}
-	}
+	dbus_filemanager_init();
+
+	g_unix_fd_add(ConnectionNumber(dpy), (GIOCondition)(G_IO_IN | G_IO_ERR | G_IO_HUP), x_fd_cb, nil);
+
+	GMainLoop *loop = g_main_loop_new(nil, FALSE);
+	g_main_loop_run(loop);
 	return 0;
 }
