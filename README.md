@@ -15,6 +15,10 @@ jfm has dependencies, those dependences are as listed.
 
 ```xorgproto libX11 libXft libXrender fontconfig freetype2 pkgconf gcc xdg-utils```
 
+# why freedesktop?  
+
+because my enviroment requires a file-manager that can upload and download files. since jfm is open source and not that big you can easily strip out XDG and DBUS.
+
 # license
 
 jfm is licensed under the [MIT license ](LICENSE)
