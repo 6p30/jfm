@@ -136,3 +136,4 @@ cyclefont(void)
 	idx = (idx + 1) % NFONTS;
 	loadfont(fontlist[idx]);
 }
+
