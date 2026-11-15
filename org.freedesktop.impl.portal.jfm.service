@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.jfm
+Exec=/usr/local/bin/jfm --portal-backend
