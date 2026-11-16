@@ -19,6 +19,10 @@ jfm has dependencies, those dependences are as listed.
 
 because my enviroment requires a file-manager that can upload and download files. since jfm is open source and not that big you can easily strip out XDG and DBUS.
 
+# known issues
+
+- flickering when resizing
+
 # license
 
 jfm is licensed under the [MIT license ](LICENSE)
