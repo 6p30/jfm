@@ -93,6 +93,8 @@ extern int depth;
 
 extern Rectangle screenr;
 extern Rectangle toolr;
+extern Rectangle backr;
+extern Rectangle forwardr;
 extern Rectangle homer;
 extern Rectangle upr;
 extern Rectangle cdr;
@@ -132,7 +134,7 @@ void redraw(void);
 void showerrstr(const char *msg);
 void loaddirs(void);
 void up(void);
-void cd(char *dir);
+int cd(char *dir);
 void mk_dir(char *name);
 void touch(char *name);
 void rm(Dir d);
