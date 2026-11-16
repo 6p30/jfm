@@ -13,6 +13,8 @@ int depth;
 
 Rectangle screenr;
 Rectangle toolr;
+Rectangle backr;
+Rectangle forwardr;
 Rectangle homer;
 Rectangle upr;
 Rectangle cdr;
@@ -73,6 +75,11 @@ static char *savename;
 static int dragidx = -1;
 static int droptarget = -1;
 static int dragmoved;
+
+static char **hist;
+static int nhist;
+static int histidx = -1;
+static int histnav;
 
 static char *accepttypes;
 
@@ -388,17 +395,26 @@ loaddirs(void)
 	sizew = m == 0 ? 3 : 1 + 1 + (int)log10((double)m);
 }
 
-void
-up(void)
+static void
+histpush(const char *p)
 {
-	char *tmp = abspath(path, "..");
-	strncpy(path, tmp, sizeof(path) - 1);
-	path[sizeof(path) - 1] = 0;
-	free(tmp);
-	loaddirs();
+	if (histidx >= 0 && histidx < nhist && strcmp(hist[histidx], p) == 0)
+		return;
+	for (int i = histidx + 1; i < nhist; i++)
+		free(hist[i]);
+	nhist = histidx + 1;
+	hist = realloc(hist, sizeof(char *) * (nhist + 1));
+	hist[nhist++] = strdup(p);
+	histidx = nhist - 1;
 }
 
 void
+up(void)
+{
+	cd("..");
+}
+
+int
 cd(char *dir)
 {
 	char newpath[8192] = {0};
@@ -421,15 +437,52 @@ cd(char *dir)
 		else
 			snprintf(newpath, sizeof(newpath), "%s/%s", path, dir);
 	}
-	if (access(newpath, F_OK) < 0) {
+	struct stat st;
+	if (stat(newpath, &st) < 0) {
 		showerrstr("Directory does not exist");
-		return;
+		return 0;
+	}
+	if (!S_ISDIR(st.st_mode)) {
+		alert("Not a directory", "The path does not point to a directory.");
+		return 0;
 	}
 	char *tmp = abspath(path, newpath);
 	strncpy(path, tmp, sizeof(path) - 1);
 	path[sizeof(path) - 1] = 0;
 	free(tmp);
 	loaddirs();
+	if (!histnav)
+		histpush(path);
+	return 1;
+}
+
+static void
+histgoto(int idx)
+{
+	if (idx < 0 || idx >= nhist)
+		return;
+	char *target = strdup(hist[idx]);
+	int old = histidx;
+	histnav = 1;
+	if (cd(target))
+		histidx = idx;
+	else
+		histidx = old;
+	histnav = 0;
+	free(target);
+	redraw();
+}
+
+static void
+back(void)
+{
+	histgoto(histidx - 1);
+}
+
+static void
+forward(void)
+{
+	histgoto(histidx + 1);
 }
 
 void
@@ -1017,16 +1070,25 @@ redraw(void)
 	xdrawline(Pt(toolr.min.x, toolr.max.y), Pt(toolr.max.x, toolr.max.y), c_toolfg);
 
 	Point p = addpt(toolr.min, Pt(0, Toolpadding));
+	backr = drawbutton(&p, c_toolfg, "<");
+	forwardr = drawbutton(&p, c_toolfg, ">");
 	homer = drawbutton(&p, c_toolfg, "~");
 	cdr = drawbutton(&p, c_toolfg, "@");
 	upr = drawbutton(&p, c_toolfg, "^");
 	p.x += Toolpadding;
-	p.y = toolr.min.y + (Dy(toolr) - font->height) / 2 + font->ascent;
-	pathr = Rect(p.x, p.y - font->ascent, p.x + xstringwidth(path), p.y + font->descent);
 	int rightw = 2 * Toolpadding + xstringwidth("+") + 2 * Toolpadding + xstringwidth("f");
 	if (pickermode)
 		rightw += 2 * Toolpadding + xstringwidth("OK") + 2 * Toolpadding + xstringwidth("Cancel");
-	p = drawtext(p, c_toolfg, path, screenr.max.x - rightw - Padding);
+	int pathmax = screenr.max.x - rightw - Padding;
+	p.y = toolr.min.y + (Dy(toolr) - font->height) / 2 + font->ascent;
+	int pw = xstringwidth(path);
+	int px2 = p.x + pw;
+	if (px2 > pathmax)
+		px2 = pathmax;
+	if (px2 < p.x)
+		px2 = p.x;
+	pathr = Rect(p.x, p.y - font->ascent, px2, p.y + font->descent);
+	p = drawtext(p, c_toolfg, path, pathmax);
 	p.x = screenr.max.x - rightw;
 	p.y = toolr.min.y + Toolpadding;
 	newdirr = drawbutton(&p, c_toolfg, "+");
@@ -1150,6 +1212,20 @@ evtkey(XEvent *e)
 	case XK_Home:
 		cd(home);
 		redraw();
+		break;
+	case XK_Left:
+		if (e->xkey.state & Mod1Mask)
+			back();
+		break;
+	case XK_Right:
+		if (e->xkey.state & Mod1Mask)
+			forward();
+		break;
+	case XK_BackSpace:
+		if (e->xkey.state & Mod1Mask) {
+			up();
+			redraw();
+		}
 		break;
 	case XK_Up:
 		if (pickermode)
@@ -1303,6 +1379,81 @@ move_selected_to(const char *destdir, int dragged)
 	redraw();
 }
 
+static void
+pathprompt(void)
+{
+	char buf[4096];
+	snprintf(buf, sizeof(buf), "%s", path);
+	if (enter("Go to directory", buf, sizeof(buf)) > 0)
+		cd(buf);
+	redraw();
+}
+
+static void
+gotoprompt(void)
+{
+	char buf[4096] = {0};
+	if (enter("Go to directory", buf, sizeof(buf)) > 0)
+		cd(buf);
+	redraw();
+}
+
+static int
+toolbarclick(Point mxy)
+{
+	if (ptinrect(mxy, backr)) {
+		back();
+		return 1;
+	}
+	if (ptinrect(mxy, forwardr)) {
+		forward();
+		return 1;
+	}
+	if (ptinrect(mxy, homer)) {
+		cd(home);
+		redraw();
+		return 1;
+	}
+	if (ptinrect(mxy, upr)) {
+		up();
+		redraw();
+		return 1;
+	}
+	if (ptinrect(mxy, cdr)) {
+		gotoprompt();
+		return 1;
+	}
+	if (ptinrect(mxy, pathr)) {
+		pathprompt();
+		return 1;
+	}
+	if (ptinrect(mxy, newdirr)) {
+		char buf[4096] = {0};
+		if (enter("Create directory", buf, sizeof(buf)) > 0) {
+			mk_dir(buf);
+			redraw();
+		}
+		return 1;
+	}
+	if (ptinrect(mxy, newfiler)) {
+		char buf[4096] = {0};
+		if (enter("Create file", buf, sizeof(buf)) > 0) {
+			touch(buf);
+			redraw();
+		}
+		return 1;
+	}
+	if (ptinrect(mxy, okr)) {
+		picker_accept();
+		return 1;
+	}
+	if (ptinrect(mxy, cancelr)) {
+		picker_cancel();
+		return 1;
+	}
+	return 0;
+}
+
 void
 evtmouse(XEvent *e)
 {
@@ -1373,13 +1524,7 @@ evtmouse(XEvent *e)
 			if (ptinrect(mxy, scrollr) &&
 			    (e->type == MotionNotify || e->type == ButtonPress))
 				scrolltrack(mxy);
-		} else if (e->type == ButtonPress && ptinrect(mxy, okr)) {
-			picker_accept();
-		} else if (e->type == ButtonPress && ptinrect(mxy, cancelr)) {
-			picker_cancel();
-		} else if (e->type == ButtonPress && ptinrect(mxy, pathr)) {
-			loaddirs();
-			redraw();
+		} else if (e->type == ButtonPress && toolbarclick(mxy)) {
 		} else if (ptinrect(mxy, viewr) || dragidx >= 0) {
 			if (e->type == ButtonPress) {
 				int idx = indexat(mxy);
@@ -1508,34 +1653,7 @@ evtmouse(XEvent *e)
 	} else if ((buttons & 4) && oldbuttons == 0 && e->type == ButtonPress) {
 		if (ptinrect(mxy, scrollr)) {
 			scrolltrack(mxy);
-		} else if (ptinrect(mxy, homer)) {
-			cd(home);
-			redraw();
-		} else if (ptinrect(mxy, upr)) {
-			up();
-			redraw();
-		} else if (ptinrect(mxy, cdr)) {
-			char buf[4096] = {0};
-			if (enter("Go to directory", buf, sizeof(buf)) > 0) {
-				cd(buf);
-				redraw();
-			}
-		} else if (ptinrect(mxy, pathr)) {
-			loaddirs();
-			redraw();
-		} else if (ptinrect(mxy, newdirr)) {
-			char buf[4096] = {0};
-			if (enter("Create directory", buf, sizeof(buf)) > 0) {
-				mk_dir(buf);
-				redraw();
-			}
-		} else if (ptinrect(mxy, newfiler)) {
-			char buf[4096] = {0};
-			if (enter("Create file", buf, sizeof(buf)) > 0) {
-				touch(buf);
-				redraw();
-			}
-		} else if (ptinrect(mxy, viewr)) {
+		} else if (!toolbarclick(mxy) && ptinrect(mxy, viewr)) {
 			int idx = indexat(mxy);
 			if (idx >= 0) {
 				Dir *d = &dirs[idx];
@@ -2188,6 +2306,7 @@ main(int argc, char *argv[])
 		showhidden = sethidden;
 
 	loaddirs();
+	histpush(path);
 	if (target_file_to_select) {
 		for (int j = 0; j < ndirs; j++) {
 			if (strcmp(dirs[j].name, target_file_to_select) == 0) {
