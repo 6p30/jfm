@@ -56,8 +56,19 @@ static char *portaldir;
 static char *portalmode;
 static char *portalname;
 
+enum {
+	ModeNormal,
+	ModeOpen,
+	ModeDirectory,
+	ModeMultiple,
+	ModeSave,
+	ModeUpload,
+};
+
 static int *selsel;
 static int nselsel;
+
+static char *savename;
 
 static int dragidx = -1;
 static int droptarget = -1;
@@ -614,20 +625,55 @@ picker_accept(void)
 	char **paths = nil;
 	int n = 0;
 
-	if (pickermode == 4) {
+	if (pickermode == ModeSave) {
 		char buf[4096] = {0};
-		if (portalname && *portalname)
-			snprintf(buf, sizeof(buf), "%s", portalname);
-		else if (selected >= 0 && selected < ndirs)
-			snprintf(buf, sizeof(buf), "%s", dirs[selected].name);
-		if (enter("Save as", buf, sizeof(buf)) <= 0) {
-			picker_cancel();
+		if (selected >= 0 && selected < ndirs && dirs[selected].isdir) {
+			cd(dirs[selected].name);
+			redraw();
 			return;
 		}
-		paths = malloc(sizeof(char *));
-		paths[0] = smprint("%s/%s", path, buf);
-		n = 1;
-	} else if (pickermode == 1) {
+		if (savename && *savename)
+			snprintf(buf, sizeof(buf), "%s", savename);
+		else if (selected >= 0 && selected < ndirs)
+			snprintf(buf, sizeof(buf), "%s", dirs[selected].name);
+		for (;;) {
+			if (enter("Save as", buf, sizeof(buf)) <= 0) {
+				picker_cancel();
+				return;
+			}
+			if (!buf[0])
+				continue;
+			char *expanded = nil;
+			if (strncmp(buf, "file://", 7) == 0)
+				expanded = xdg_uri_to_path(buf);
+			else if (buf[0] == '~')
+				expanded = expandtilde(buf);
+			else
+				expanded = strdup(buf);
+			char *dest = abspath(path, expanded);
+			free(expanded);
+			struct stat st;
+			if (stat(dest, &st) == 0 && S_ISDIR(st.st_mode)) {
+				cd(buf);
+				free(dest);
+				redraw();
+				return;
+			}
+			if (access(dest, F_OK) == 0) {
+				char *msg = smprint("Replace %s?", buf);
+				int yes = confirm(msg);
+				free(msg);
+				if (!yes) {
+					free(dest);
+					continue;
+				}
+			}
+			paths = malloc(sizeof(char *));
+			paths[0] = dest;
+			n = 1;
+			break;
+		}
+	} else if (pickermode == ModeOpen) {
 		if (selected >= 0 && selected < ndirs && dirs[selected].isdir) {
 			cd(dirs[selected].name);
 			redraw();
@@ -636,6 +682,8 @@ picker_accept(void)
 		for (int i = 0; i < nselsel; i++) {
 			if (selsel[i] < 0 || selsel[i] >= ndirs)
 				continue;
+			if (dirs[selsel[i]].isdir)
+				continue;
 			paths = realloc(paths, sizeof(char *) * (n + 1));
 			paths[n++] = smprint("%s/%s", path, dirs[selsel[i]].name);
 		}
@@ -643,10 +691,12 @@ picker_accept(void)
 		for (int i = 0; i < nselsel; i++) {
 			if (selsel[i] < 0 || selsel[i] >= ndirs)
 				continue;
+			if (pickermode == ModeUpload && dirs[selsel[i]].isdir)
+				continue;
 			paths = realloc(paths, sizeof(char *) * (n + 1));
 			paths[n++] = smprint("%s/%s", path, dirs[selsel[i]].name);
 		}
-		if (n == 0 && pickermode == 2) {
+		if (n == 0 && pickermode == ModeDirectory) {
 			paths = malloc(sizeof(char *));
 			paths[0] = strdup(path);
 			n = 1;
@@ -1117,7 +1167,7 @@ evtkey(XEvent *e)
 		if (selected >= 0 && selected < ndirs) {
 			Dir *d = &dirs[selected];
 			if (d->isdir) {
-				if (pickermode == 2)
+				if (pickermode == ModeDirectory)
 					picker_accept();
 				else {
 					cd(d->name);
@@ -1339,7 +1389,7 @@ evtmouse(XEvent *e)
 					if (idx == lastclickidx && (now - lastclick < 400)) {
 						Dir *d = &dirs[idx];
 						if (d->isdir) {
-							if (pickermode == 2)
+							if (pickermode == ModeDirectory)
 								picker_accept();
 							else {
 								cd(d->name);
@@ -1557,8 +1607,11 @@ usage(void)
 		"  -m, --select-multiple   act as a file chooser and print every selected path\n"
 		"  -d, --select-directory  act as a directory chooser\n"
 		"  -s, --save-file         act as a save dialog\n"
+		"      --save-as[=NAME]    act as a save dialog with an optional suggested name\n"
+		"      --upload            choose one or more files (for browser uploads)\n"
 		"  -S, --select            reveal/select specified item in its parent folder\n"
 		"  -u, --print-uri         print file:// uris instead of plain paths\n"
+		"  -a, --accept TYPES      only show files matching TYPES (mime types or globs)\n"
 		"  -t, --title TITLE       set the window title\n"
 		"  -D, --directory DIR     start inside DIR\n"
 		"  -H, --show-hidden       show hidden files\n"
@@ -1743,6 +1796,9 @@ main(int argc, char *argv[])
 		OPT_PORTAL_ACCEPT,
 		OPT_PORTAL_MODE,
 		OPT_PORTAL_NAME,
+		OPT_SAVE_AS,
+		OPT_UPLOAD,
+		OPT_ACCEPT,
 	};
 	static struct option options[] = {
 		{ "select-file", no_argument, nil, 'f' },
@@ -1751,6 +1807,10 @@ main(int argc, char *argv[])
 		{ "select-multiple", no_argument, nil, 'm' },
 		{ "multiple", no_argument, nil, 'm' },
 		{ "save-file", no_argument, nil, 's' },
+		{ "save-as", optional_argument, nil, OPT_SAVE_AS },
+		{ "upload", no_argument, nil, OPT_UPLOAD },
+		{ "accept", required_argument, nil, OPT_ACCEPT },
+		{ "filter", required_argument, nil, OPT_ACCEPT },
 		{ "select", no_argument, nil, 'S' },
 		{ "reveal", no_argument, nil, 'S' },
 		{ "print-uri", no_argument, nil, 'u' },
@@ -1781,7 +1841,7 @@ main(int argc, char *argv[])
 	cfg = config_open();
 	readhome();
 
-	int mode = 0;
+	int mode = ModeNormal;
 	int wanturi = 0;
 	int sethidden = -1;
 	int action = 0;
@@ -1791,21 +1851,36 @@ main(int argc, char *argv[])
 	char *dirarg = nil;
 	char *printmime = nil;
 	char *openuri = nil;
+	char *saveas = nil;
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "hvfmdsut:D:HiIbBpPM:O:RS", options, nil)) != -1) {
+	while ((opt = getopt_long(argc, argv, "hvfmdsut:D:HiIbBpPM:O:RSa:", options, nil)) != -1) {
 		switch (opt) {
 		case 'f':
-			mode = 1;
+			mode = ModeOpen;
 			break;
 		case 'm':
-			mode = 3;
+			mode = ModeMultiple;
 			break;
 		case 'd':
-			mode = 2;
+			mode = ModeDirectory;
 			break;
 		case 's':
-			mode = 4;
+			mode = ModeSave;
+			break;
+		case OPT_SAVE_AS:
+			mode = ModeSave;
+			if (optarg)
+				saveas = optarg;
+			else if (optind < argc && argv[optind][0] != '-')
+				saveas = argv[optind++];
+			break;
+		case OPT_UPLOAD:
+			mode = ModeUpload;
+			break;
+		case OPT_ACCEPT:
+		case OPT_PORTAL_ACCEPT:
+			accepttypes = optarg;
 			break;
 		case 'S':
 			select_mode = 1;
@@ -1867,9 +1942,6 @@ main(int argc, char *argv[])
 		case OPT_PORTAL_DIR:
 			portaldir = optarg;
 			break;
-		case OPT_PORTAL_ACCEPT:
-			accepttypes = optarg;
-			break;
 		case OPT_PORTAL_MODE:
 			portalmode = optarg;
 			break;
@@ -1884,17 +1956,49 @@ main(int argc, char *argv[])
 
 	if (portalmode) {
 		if (strcmp(portalmode, "save") == 0)
-			mode = 4;
+			mode = ModeSave;
 		else if (strcmp(portalmode, "directory") == 0)
-			mode = 2;
+			mode = ModeDirectory;
 		else if (strcmp(portalmode, "multiple") == 0)
-			mode = 3;
+			mode = ModeUpload;
 		else
-			mode = 1;
+			mode = ModeOpen;
 		if (!title)
 			title = portaltitle;
 		if (!dirarg)
 			dirarg = portaldir;
+	}
+
+	if (mode == ModeSave && !saveas && portalname && *portalname)
+		saveas = portalname;
+
+	if (saveas) {
+		char *expanded = nil;
+		if (strncmp(saveas, "file://", 7) == 0)
+			expanded = xdg_uri_to_path(saveas);
+		else if (saveas[0] == '~')
+			expanded = expandtilde(saveas);
+		else
+			expanded = strdup(saveas);
+		size_t len = strlen(expanded);
+		struct stat st;
+		if ((len > 0 && expanded[len - 1] == '/') ||
+		    (stat(expanded, &st) == 0 && S_ISDIR(st.st_mode))) {
+			dirarg = expanded;
+		} else {
+			char *slash = strrchr(expanded, '/');
+			if (slash) {
+				*slash = 0;
+				savename = strdup(slash + 1);
+				dirarg = *expanded ? expanded : strdup("/");
+				if (*expanded)
+					expanded = nil;
+			} else {
+				savename = expanded;
+				expanded = nil;
+			}
+			free(expanded);
+		}
 	}
 
 	if (printmime) {
