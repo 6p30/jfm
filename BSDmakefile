@@ -43,3 +43,4 @@ uninstall:
 	-update-desktop-database /usr/local/share/applications >/dev/null 2>&1 || true
 
 .PHONY: all clean install uninstall
+
